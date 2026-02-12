@@ -4,17 +4,34 @@ Tests for chunker.py
 import unittest
 import tempfile
 import os
+import json
 from chunker import Chunker
+from config import Config
 
 
 class TestChunker(unittest.TestCase):
     def setUp(self):
-        self.chunker = Chunker()
+        # Create a temporary config
+        self.config_dir = tempfile.mkdtemp()
+        self.config_file = os.path.join(self.config_dir, 'config.json')
+        
+        config_data = {
+            "remotes": ["test1:"],
+            "chunk_size": 104857600,
+            "use_crypt": False,
+        }
+        
+        with open(self.config_file, 'w') as f:
+            json.dump(config_data, f)
+        
+        self.config = Config(self.config_file)
+        self.chunker = Chunker(self.config)
         self.temp_dir = tempfile.mkdtemp()
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        shutil.rmtree(self.config_dir, ignore_errors=True)
 
     def test_get_chunk_count_small_file(self):
         """Test chunk count for file smaller than chunk size"""

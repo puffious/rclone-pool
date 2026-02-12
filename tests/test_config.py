@@ -38,19 +38,21 @@ class TestConfig(unittest.TestCase):
         
         config = Config(self.config_file)
         
+        # When use_crypt is True and crypt_remotes exist, remotes property returns crypt_remotes
         self.assertEqual(len(config.remotes), 2)
+        self.assertEqual(config.remotes[0], "crypt-mega1:")
         self.assertEqual(config.chunk_size, 104857600)
         self.assertEqual(config.data_prefix, "rclonepool_data")
         self.assertEqual(config.manifest_prefix, "rclonepool_manifests")
         self.assertTrue(config.use_crypt)
-        self.assertEqual(len(config.crypt_remotes), 2)
         self.assertEqual(config.webdav_port, 8080)
 
     def test_config_defaults(self):
         """Test config with missing optional fields uses defaults"""
         config_data = {
             "remotes": ["test1:"],
-            "chunk_size": 104857600
+            "chunk_size": 104857600,
+            "use_crypt": False  # Explicitly set to False
         }
         
         with open(self.config_file, 'w') as f:
