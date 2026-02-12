@@ -1,0 +1,2 @@
+# No external dependencies! Uses only Python stdlib.
+# rclone must be installed separately: https://rclone.org/install/
