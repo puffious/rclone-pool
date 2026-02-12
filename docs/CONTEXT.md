@@ -625,4 +625,337 @@ Overridable with `-c` / `--config` flag.
 | `temp_dir` | string | `"/dev/shm/rclonepool"` | Temp directory for chunk operations. Use RAM-backed filesystem |
 | `rclone_binary` | string | `"rclone"` | Path to rclone binary |
 | `rclone_flags` | string[] | `["--fast-list", "--no-traverse"]` | Additional flags passed to all rclone commands |
-| `webdav_
+| `webdav_port` | int | `8080` | Port for the WebDAV server |
+| `webdav_host` | string | `"0.0.0.0"` | Bind address for the WebDAV server. Use `127.0.0.1` for local-only access |
+
+### 9.4 Choosing Chunk Size
+
+| Chunk Size | Chunks per 20GB Remote | Max File Size (999 chunks) | Balancing Granularity | Upload Overhead |
+|---|---|---|---|---|
+| 10MB | 2,048 | ~10GB | Excellent | High (many rclone calls) |
+| 50MB | 409 | ~50GB | Very good | Medium |
+| **100MB** | **204** | **~100GB** | **Good (default)** | **Low** |
+| 250MB | 81 | ~250GB | Fair | Very low |
+| 500MB | 40 | ~500GB | Poor | Minimal |
+| 1GB | 20 | ~1TB | Poor | Minimal |
+
+Recommendation:
+- **100MB** is the sweet spot for most users
+- Use **50MB** if you have many remotes and want finer-grained balancing
+- Use **250MB+** only if you have very large files and few remotes
+
+### 9.5 Temp Directory Recommendations
+
+| OS | Recommended `temp_dir` | Notes |
+|---|---|---|
+| Linux | `/dev/shm/rclonepool` | tmpfs, RAM-backed, no disk writes |
+| macOS | `/tmp/rclonepool` | macOS `/tmp` is often RAM-backed via `tmps` but not guaranteed. Alternatively use a RAM disk: `diskutil erasevolume HFS+ 'RAMDisk' $(hdiutil attach -nomount ram://2097152)` |
+| Linux (no /dev/shm) | `/run/user/$(id -u)/rclonepool` | User-specific tmpfs on systemd systems |
+| Fallback | `/tmp/rclonepool` | Works everywhere but may write to disk |
+
+---
+
+## 10. Memory and Performance Characteristics
+
+### 10.1 Memory Usage
+
+| Operation | Peak RAM Usage | Notes |
+|---|---|---|
+| Upload (chunked) | ~chunk_size (100MB) | One chunk in memory at a time |
+| Upload (small file) | ~file_size | Entire file in memory |
+| Download (full) | ~chunk_size (100MB) | One chunk in memory at a time, written to disk sequentially |
+| Download (range) | ~requested_range | Only the requested bytes, fetched via `rclone cat` |
+| WebDAV GET (full) | ~chunk_size (100MB) | Chunks streamed to client one at a time |
+| WebDAV GET (range) | ~requested_range | Typically 1-10MB for video streaming |
+| Manifest operations | ~few KB per manifest | JSON files are tiny |
+| Balancer | ~few KB | Just a dict of remote → used_bytes |
+
+### 10.2 Disk I/O
+
+| Operation | Disk Writes | Location |
+|---|---|---|
+| Upload chunk | 1 temp write + 1 temp delete | `/dev/shm` (RAM) |
+| Download chunk | 1 temp write + 1 temp delete | `/dev/shm` (RAM) |
+| Download to file | 1 sequential write | User-specified output path |
+| WebDAV upload | 1 temp write + 1 temp delete per chunk | `/dev/shm` (RAM) |
+| WebDAV streaming | 0 disk writes | Streamed directly from rclone to HTTP response |
+| Manifest save | 0 (goes to remote) | Via rclone, temp in `/dev/shm` |
+
+**Net SSD writes for typical usage: ZERO** (assuming `/dev/shm` is used)
+
+### 10.3 Network I/O
+
+| Operation | Network Calls | Notes |
+|---|---|---|
+| Upload 1GB file | 10 chunk uploads + 5 manifest uploads | 10 chunks × 100MB + manifest to each remote |
+| Download 1GB file | 1 manifest download + 10 chunk downloads | Manifest from first available remote |
+| Stream 10s of video | 1 manifest download + 1-2 chunk range reads | `rclone cat` with offset/count |
+| List files | 1 `rclone lsf` + N manifest downloads | N = number of files in directory |
+| Delete file | 1 manifest load + C chunk deletes + R manifest deletes | C = chunk count, R = remote count |
+
+### 10.4 Latency Expectations
+
+| Operation | Expected Latency | Bottleneck |
+|---|---|---|
+| Upload chunk | 2-30s per chunk | MEGA upload speed |
+| Download chunk | 2-30s per chunk | MEGA download speed |
+| Range read (1MB) | 1-5s | rclone startup + MEGA API latency |
+| List files | 2-10s | rclone lsf + manifest parsing |
+| Video seek | 2-8s | Chunk fetch latency |
+| Manifest load | 1-3s | First rclone download |
+
+Note: Video streaming will have noticeable seek latency (2-8 seconds) because each seek may require fetching a new chunk from MEGA. This is inherent to the architecture and cannot be avoided without a local cache.
+
+### 10.5 Performance Optimization Ideas (Future)
+
+1. **Chunk cache in RAM** — Keep recently accessed chunks in an LRU cache in `/dev/shm`. This would make repeated range reads (e.g., video player buffering) instant.
+
+2. **Prefetch** — When a range read hits chunk N, proactively fetch chunk N+1 in a background thread. This would smooth out sequential streaming.
+
+3. **Parallel chunk uploads** — Upload multiple chunks simultaneously using a thread pool. Would dramatically speed up large file uploads.
+
+4. **Parallel chunk downloads** — Same for downloads.
+
+5. **Manifest caching on disk** — Cache manifests locally (they are tiny) to avoid fetching from remotes on every operation. The current in-memory cache works but is lost on restart.
+
+6. **Connection pooling** — Reuse rclone processes instead of spawning a new one per operation. Could use `rclone rc` (remote control) API.
+
+---
+
+## 11. Error Handling and Edge Cases
+
+### 11.1 Failure Modes
+
+| Failure | Impact | Current Handling | Planned Handling |
+|---|---|---|---|
+| Remote offline during upload | Chunk upload fails | Error logged, upload aborted | Retry with backoff, skip to next remote |
+| Remote offline during download | Chunk download fails | Error logged, download aborted | Retry with backoff |
+| Remote offline during manifest save | Manifest not saved to that remote | Warning logged, continues to other remotes | Already handled (saves to all, warns on failure) |
+| All remotes offline | Nothing works | Error messages | Graceful error with retry prompt |
+| Manifest missing from all remotes | File appears lost | "No manifest found" error | Scan data folders for orphaned chunks, attempt reconstruction |
+| Chunk missing from remote | File partially unrecoverable | Download fails at that chunk | Skip with warning, or use parity to reconstruct (future) |
+| Manifest corrupted | File metadata lost | JSON parse error | Fall back to other remotes' copies |
+| Disk full on remote during upload | rclone error | Upload fails, error logged | Detect, skip to next remote, retry chunk |
+| `/dev/shm` full | Temp file write fails | OS error | Detect, warn, suggest increasing tmpfs size |
+| rclone binary not found | All operations fail | FileNotFoundError | Clear error message with install instructions |
+| rclone config missing remote | Operations on that remote fail | rclone error propagated | Validate remotes on startup |
+| Duplicate file upload | Old chunks orphaned | No detection | Check for existing manifest, prompt for overwrite, clean old chunks |
+| Concurrent uploads to same path | Race condition on manifest | Last writer wins | File-level locking (future) |
+
+### 11.2 Chunk Naming Collisions
+
+If two different files have the same name but are in different directories:
+
+```text
+/movies/clip.mp4    → chunks: clip.mp4.chunk.000, clip.mp4.chunk.001
+/backup/clip.mp4    → chunks: clip.mp4.chunk.000, clip.mp4.chunk.001  ← COLLISION!
+```
+
+**Current status:** This is a known bug. Chunks would overwrite each other.
+
+**Planned fix:** Include a hash of the full path in the chunk name:
+
+```text
+/movies/clip.mp4    → chunks: a1b2c3_clip.mp4.chunk.000
+/backup/clip.mp4    → chunks: d4e5f6_clip.mp4.chunk.000
+```
+
+Or use the full safe path:
+
+```text
+/movies/clip.mp4    → chunks: movies_clip.mp4.chunk.000
+/backup/clip.mp4    → chunks: backup_clip.mp4.chunk.000
+```
+
+---
+
+## 12. Security Considerations
+
+### 12.1 Threat Model
+
+| Threat | Mitigation |
+|---|---|
+| Cloud provider reads your files | rclone crypt encrypts content + filenames |
+| Cloud provider correlates files by size | Chunking makes all objects ~100MB (uniform) |
+| Cloud provider analyzes access patterns | Not mitigated — access patterns visible |
+| MITM on network | rclone uses HTTPS for MEGA API |
+| Local attacker reads rclone config | Use `RCLONE_CONFIG_PASS` to encrypt rclone.conf |
+| Local attacker reads temp files | Temp files are in RAM (`/dev/shm`), deleted immediately after use |
+| Local attacker reads manifests in RAM | Python process memory — standard OS protections apply |
+| WebDAV server accessed by unauthorized users | Bind to `127.0.0.1`, or add authentication (future) |
+| Manifest tampering on remote | Checksum field in manifest (weak — future: HMAC) |
+
+### 12.2 What is NOT Encrypted
+
+- **rclone.conf** — contains remote credentials and crypt passwords (obfuscated, not encrypted). Use `RCLONE_CONFIG_PASS` to encrypt it.
+- **Manifest structure** — while the manifest content is encrypted by crypt on the remote, the local in-memory cache is plaintext. This is necessary for operation.
+- **WebDAV traffic** — the WebDAV server runs plain HTTP. If exposed to the network, use a reverse proxy with TLS (nginx, caddy).
+- **rclone process arguments** — chunk paths and remote names are visible in `ps aux` output on the local machine.
+
+### 12.3 WebDAV Authentication (Planned)
+
+Currently the WebDAV server has no authentication. Planned options:
+
+1. **HTTP Basic Auth** — simple username/password
+2. **API key in header** — custom `X-API-Key` header
+3. **Bind to localhost only** — simplest, use `127.0.0.1` as host
+
+---
+
+## 13. Future Roadmap
+
+### 13.1 v0.2 — Robustness
+
+- [ ] Fix chunk naming collision for same-named files in different directories
+- [ ] Add retry logic with exponential backoff for failed rclone operations
+- [ ] Add `rclonepool verify` command — check all chunks exist and match manifest
+- [ ] Add `rclonepool repair` command — re-upload missing chunks from local copy
+- [ ] Add `rclonepool orphans` command — find chunks with no manifest reference
+- [ ] Local manifest cache file (persist across restarts)
+- [ ] Duplicate file detection (check manifest before upload)
+
+### 13.2 v0.3 — Performance
+
+- [ ] Parallel chunk uploads (configurable thread count)
+- [ ] Parallel chunk downloads
+- [ ] Chunk LRU cache in `/dev/shm` for streaming
+- [ ] Prefetch next chunk during sequential reads
+- [ ] Use `rclone rcd` (daemon mode) for connection pooling
+- [ ] Progress bars for CLI uploads/downloads
+
+### 13.3 v0.4 — Balancing
+
+- [ ] Round-robin with least-used tiebreaker balancing
+- [ ] `rclonepool rebalance` command
+- [ ] Auto-rebalance when new remote added
+- [ ] Configurable balancing strategy (least-used, round-robin, random, weighted)
+- [ ] Remote weight/priority configuration (prefer faster remotes)
+
+### 13.4 v0.5 — Redundancy
+
+- [ ] Reed-Solomon parity chunks (configurable: e.g., 3 data + 1 parity)
+- [ ] `rclonepool rebuild` — reconstruct lost chunks from parity
+- [ ] Configurable replication factor (store each chunk on N remotes)
+- [ ] Health monitoring — periodic check that all chunks are accessible
+
+### 13.5 v0.6 — Advanced Features
+
+- [ ] WebDAV authentication (Basic Auth, API key)
+- [ ] HTTPS support for WebDAV server
+- [ ] Deduplication (content-addressable storage using chunk hashes)
+- [ ] Compression before encryption (zstd)
+- [ ] Bandwidth throttling (per-remote)
+- [ ] Web UI dashboard (storage usage, file browser, upload/download)
+- [ ] Docker container with all dependencies
+- [ ] Systemd service file for auto-start
+
+### 13.6 v1.0 — Production Ready
+
+- [ ] Comprehensive test suite
+- [ ] CI/CD pipeline
+- [ ] Documentation site
+- [ ] Plugin system for custom balancing/chunking strategies
+- [ ] Multi-user support with isolated pools
+- [ ] API for programmatic access (REST + WebSocket)
+
+---
+
+## 14. Comparison with Alternatives
+
+| Feature | rclonepool | rclone union+chunker | Minio Gateway | SeaweedFS | IPFS |
+|---|---|---|---|---|---|
+| Chunks across remotes | ✅ | ❌ | ❌ | ✅ | ✅ |
+| Works with MEGA/GDrive/etc | ✅ | ✅ | ❌ (S3 only) | ❌ | ❌ |
+| Encryption | ✅ (rclone crypt) | ✅ | ✅ | ⚠️ | ⚠️ |
+| Video streaming with seek | ✅ | ⚠️ | ✅ | ✅ | ❌ |
+| No local state needed | ✅ | ✅ | ❌ | ❌ | ❌ |
+| No external dependencies | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Files larger than single remote | ✅ | ❌ | N/A | ✅ | ✅ |
+| Balanced distribution | ✅ | ❌ | N/A | ✅ | ✅ |
+| rclone integration | ✅ (WebDAV) | ✅ (native) | ⚠️ | ❌ | ❌ |
+| Setup complexity | Low | Very Low | High | High | High |
+| Production ready | ❌ (v0.1) | ✅ | ✅ | ✅ | ✅ |
+
+---
+
+## 15. Glossary
+
+| Term | Definition |
+|---|---|
+| **Remote** | An rclone-configured storage backend (e.g., `mega1:`, `gdrive:`, `s3:`) |
+| **Crypt remote** | An rclone remote of type `crypt` that wraps another remote with encryption |
+| **Chunk** | A fixed-size piece of a file, stored as a separate object on a remote |
+| **Manifest** | A JSON file describing a file's chunks, their locations, and metadata |
+| **Balancer** | The component that decides which remote receives each chunk |
+| **Pool** | The logical combination of all remotes, appearing as unified storage |
+| **Data prefix** | The folder name on each remote where chunks are stored |
+| **Manifest prefix** | The folder name on each remote where manifests are stored |
+| **Range request** | An HTTP request for a specific byte range of a file (used for video seeking) |
+| **tmpfs** | A RAM-backed temporary filesystem (e.g., `/dev/shm` on Linux) |
+| **WebDAV** | Web Distributed Authoring and Versioning — an HTTP extension for file management |
+| **PROPFIND** | A WebDAV method for querying file/directory properties |
+| **Multistatus** | A WebDAV XML response format containing multiple resource properties |
+
+---
+
+## 16. Development Notes
+
+### 16.1 Running in Development
+
+```bash
+# Clone the project
+git clone <repo>
+cd rclonepool
+
+# No dependencies to install!
+
+# Run init
+python rclonepool.py init
+
+# Test with local remotes (no cloud needed)
+mkdir -p /tmp/fake-remote-{1,2,3}
+# Add to rclone.conf:
+#   [local1]
+#   type = local
+#   nounc = true
+# (repeat for local2, local3)
+# Then configure rclonepool with remotes: ["local1:/tmp/fake-remote-1/", ...]
+
+# Run server
+python rclonepool.py serve --port 8080
+
+# Test upload
+python rclonepool.py upload testfile.bin /test/testfile.bin
+
+# Test download
+python rclonepool.py download /test/testfile.bin ./downloaded.bin
+
+# Test via rclone WebDAV
+rclone ls :webdav,url=http://localhost:8080:
+```
+
+### 16.2 Debugging
+
+```bash
+# Enable debug logging
+export LOGLEVEL=DEBUG
+python rclonepool.py serve
+
+# Or modify the logging line in rclonepool.py:
+# logging.basicConfig(level=logging.DEBUG, ...)
+
+# Watch rclone commands being executed:
+# All rclone commands are logged at DEBUG level with full arguments
+```
+
+### 16.3 Testing Strategies
+
+1. **Unit tests** — Mock `RcloneBackend` to test `Chunker`, `Balancer`, `ManifestManager` in isolation
+2. **Integration tests with local remotes** — Use `type = local` rclone remotes pointing to temp directories
+3. **Integration tests with real remotes** — Use a dedicated test account
+4. **WebDAV compliance tests** — Use `litmus` WebDAV test suite
+5. **Streaming tests** — Use `curl` with `Range` headers, or `ffprobe` on the WebDAV URL
+
+---
+
+*This document is the complete specification for rclonepool v0.1. It should contain everything needed to understand, implement, extend, debug, and reason about the system.*
