@@ -1,0 +1,15 @@
+# Example rclonepool configuration for Docker
+
+{
+  "remotes": ["crypt-mega1:", "crypt-mega2:", "crypt-mega3:", "crypt-mega4:", "crypt-mega5:"],
+  "chunk_size": 104857600,
+  "data_prefix": "rclonepool_data",
+  "manifest_prefix": "rclonepool_manifests",
+  "use_crypt": true,
+  "crypt_remotes": ["crypt-mega1:", "crypt-mega2:", "crypt-mega3:", "crypt-mega4:", "crypt-mega5:"],
+  "temp_dir": "/tmp/rclonepool",
+  "rclone_binary": "rclone",
+  "rclone_flags": ["--fast-list", "--no-traverse"],
+  "webdav_port": 8080,
+  "webdav_host": "0.0.0.0"
+}

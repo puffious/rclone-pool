@@ -26,7 +26,7 @@ class RcloneBackend:
         """Ensure temp directory exists."""
         os.makedirs(self.config.temp_dir, exist_ok=True)
 
-    def _run(self, args: list, capture_output=True, input_data=None) -> subprocess.CompletedProcess:
+    def _run(self, args: list, capture_output=True, input_data=None, suppress_errors=False) -> subprocess.CompletedProcess:
         """Run an rclone command."""
         cmd = [self.rclone] + args
         log.debug(f"  Running: {' '.join(cmd)}")
@@ -38,7 +38,7 @@ class RcloneBackend:
                 input=input_data,
                 timeout=600  # 10 minute timeout
             )
-            if result.returncode != 0:
+            if result.returncode != 0 and not suppress_errors:
                 stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
                 log.error(f"  rclone error (code {result.returncode}): {stderr[:500]}")
             return result
@@ -74,12 +74,12 @@ class RcloneBackend:
             except OSError:
                 pass
 
-    def download_bytes(self, remote: str, remote_path: str) -> Optional[bytes]:
+    def download_bytes(self, remote: str, remote_path: str, suppress_errors=False) -> Optional[bytes]:
         """Download a file from remote and return as bytes."""
         temp_path = os.path.join(self.config.temp_dir, f"dl_{os.getpid()}_{hash(remote_path) & 0xFFFFFFFF}.tmp")
         try:
             src = f"{remote}{remote_path}"
-            result = self._run(['copyto', src, temp_path] + self.flags)
+            result = self._run(['copyto', src, temp_path] + self.flags, suppress_errors=suppress_errors)
 
             if result.returncode != 0:
                 return None
@@ -137,6 +137,11 @@ class RcloneBackend:
         result = self._run(['lsf', target, '--files-only'])
 
         if result.returncode != 0:
+            # Directory might not exist yet — that's okay, return empty list
+            stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+            if 'directory not found' in stderr.lower() or 'not found' in stderr.lower():
+                log.debug(f"  Directory {target} does not exist yet (this is normal)")
+                return []
             return None
 
         stdout = result.stdout.decode('utf-8', errors='replace')
@@ -149,6 +154,10 @@ class RcloneBackend:
         result = self._run(['lsf', target, '--dirs-only'])
 
         if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+            if 'directory not found' in stderr.lower() or 'not found' in stderr.lower():
+                log.debug(f"  Directory {target} does not exist yet (this is normal)")
+                return []
             return None
 
         stdout = result.stdout.decode('utf-8', errors='replace')
@@ -156,14 +165,13 @@ class RcloneBackend:
         return dirs
 
     def get_space(self, remote: str) -> Tuple[int, int, int]:
-        """
-        Get space usage for a remote. Returns (used, free, total) in bytes.
-        Falls back to rclone about if available.
-        """
+        """Get space usage for a remote. Returns (used, free, total) in bytes."""
         result = self._run(['about', remote, '--json'])
 
         if result.returncode != 0:
-            log.warning(f"  Could not get space info for {remote}")
+            # Some remotes (especially crypt) don't support 'about'
+            # Try the underlying remote
+            log.debug(f"  'about' not supported for {remote}, returning zeros")
             return (0, 0, 0)
 
         try:
@@ -173,7 +181,6 @@ class RcloneBackend:
             free = info.get('free', 0) or 0
             total = info.get('total', 0) or 0
 
-            # Some remotes don't report total but report used and free
             if total == 0 and (used > 0 or free > 0):
                 total = used + free
 

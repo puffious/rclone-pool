@@ -84,7 +84,7 @@ class ManifestManager:
         # Try each remote until we find it
         for remote in self.config.remotes:
             try:
-                data = self.backend.download_bytes(remote, manifest_remote_path)
+                data = self.backend.download_bytes(remote, manifest_remote_path, suppress_errors=True)
                 if data:
                     manifest = json.loads(data.decode('utf-8'))
                     self._manifest_cache[file_path] = manifest
@@ -97,17 +97,23 @@ class ManifestManager:
         log.warning(f"  No manifest found for {file_path}")
         return None
 
-    def list_manifests(self, remote_dir: str = '/') -> List[dict]:
-        """List all manifests, optionally filtered by directory."""
+    def list_manifests(self, remote_dir: str = '/', recursive: bool = False) -> List[dict]:
+        """List all manifests, optionally filtered by directory.
+        
+        Args:
+            remote_dir: Directory to filter by
+            recursive: If True, include files in subdirectories as well
+        """
         remote_dir = remote_dir.rstrip('/') or '/'
         manifests = []
         seen_files = set()
 
-        # Try the first available remote for listing
         for remote in self.config.remotes:
             try:
                 files = self.backend.list_files(remote, self.config.manifest_prefix)
-                if files is None:
+
+                # Handle None (error) or empty list (no manifests yet)
+                if not files:
                     continue
 
                 for f in files:
@@ -118,15 +124,34 @@ class ManifestManager:
                     seen_files.add(f)
 
                     manifest_path = f"{self.config.manifest_prefix}/{f}"
-                    data = self.backend.download_bytes(remote, manifest_path)
+                    data = self.backend.download_bytes(remote, manifest_path, suppress_errors=True)
                     if data:
-                        manifest = json.loads(data.decode('utf-8'))
-                        # Filter by directory
-                        if remote_dir == '/' or manifest.get('remote_dir', '/') == remote_dir:
-                            manifests.append(manifest)
-                            self._manifest_cache[manifest['file_path']] = manifest
+                        try:
+                            manifest = json.loads(data.decode('utf-8'))
+                            manifest_dir = manifest.get('remote_dir', '/')
+                            
+                            # Filter logic
+                            if remote_dir == '/':
+                                # At root, include if exact match or if recursive
+                                if manifest_dir == '/' or recursive:
+                                    manifests.append(manifest)
+                                    self._manifest_cache[manifest['file_path']] = manifest
+                            else:
+                                # In a subdirectory
+                                if recursive:
+                                    # Include if in this dir or any subdirectory
+                                    if manifest_dir == remote_dir or manifest_dir.startswith(remote_dir.rstrip('/') + '/'):
+                                        manifests.append(manifest)
+                                        self._manifest_cache[manifest['file_path']] = manifest
+                                else:
+                                    # Include only if exact match
+                                    if manifest_dir == remote_dir:
+                                        manifests.append(manifest)
+                                        self._manifest_cache[manifest['file_path']] = manifest
+                        except json.JSONDecodeError:
+                            log.warning(f"  Corrupt manifest: {manifest_path} on {remote}")
+                            continue
 
-                # If we got results from one remote, no need to check others
                 if manifests:
                     break
             except Exception as e:

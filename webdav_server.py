@@ -65,6 +65,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if not path:
             path = '/'
 
+        # Ignore common browser requests for favicons and icons
+        if self._is_browser_resource(path):
+            self.send_error(404, 'Not Found')
+            return
+
         if path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'httpd/unix-directory')
@@ -87,13 +92,18 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'httpd/unix-directory')
                 self.end_headers()
             else:
-                self.send_error(404, 'Not Found')
+                self._safe_send_error(404, 'Not Found')
 
     # ─── GET (with Range support for video streaming) ─────
     def do_GET(self):
         path = unquote(self.path).rstrip('/')
         if not path:
             path = '/'
+
+        # Ignore common browser requests for favicons and icons
+        if self._is_browser_resource(path):
+            self.send_error(404, 'Not Found')
+            return
 
         if path == '/':
             self._send_directory_listing('/')
@@ -106,7 +116,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             if manifests:
                 self._send_directory_listing(path)
                 return
-            self.send_error(404, 'Not Found')
+            self._safe_send_error(404, 'Not Found')
             return
 
         file_size = manifest['file_size']
@@ -140,7 +150,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
                 data = self.pool.download_range(path, start, length)
                 if data is None:
-                    self.send_error(500, 'Failed to read range')
+                    self._safe_send_error(500, 'Failed to read range')
                     return
 
                 self.send_response(206)
@@ -153,7 +163,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
             except (ValueError, IndexError) as e:
                 log.error(f"Invalid Range header: {range_header} — {e}")
-                self.send_error(416, 'Range Not Satisfiable')
+                self._safe_send_error(416, 'Range Not Satisfiable')
         else:
             # Full file download — stream chunk by chunk
             self.send_response(200)
@@ -180,7 +190,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0))
 
         if content_length == 0:
-            self.send_error(411, 'Length Required')
+            self._safe_send_error(411, 'Length Required')
             return
 
         log.info(f"WebDAV PUT: {path} ({content_length} bytes)")
@@ -208,7 +218,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Length', '0')
                 self.end_headers()
             else:
-                self.send_error(500, 'Upload failed')
+                self._safe_send_error(500, 'Upload failed')
         finally:
             try:
                 os.remove(temp_path)
@@ -225,7 +235,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
         else:
-            self.send_error(404, 'Not Found')
+            self._safe_send_error(404, 'Not Found')
 
     # ─── MKCOL ─────────────────────────────────────────────
     def do_MKCOL(self):
@@ -240,7 +250,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         dest_header = self.headers.get('Destination', '')
 
         if not dest_header:
-            self.send_error(400, 'Destination header required')
+            self._safe_send_error(400, 'Destination header required')
             return
 
         # Parse destination — strip scheme+host
@@ -252,7 +262,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         manifest = self.pool.manifest_mgr.load_manifest_for_file(src_path)
         if not manifest:
-            self.send_error(404, 'Source not found')
+            self._safe_send_error(404, 'Source not found')
             return
 
         # Update manifest with new path
@@ -278,6 +288,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if not path:
             path = '/'
 
+        # Ignore common browser requests
+        if self._is_browser_resource(path):
+            self._safe_send_error(404, 'Not Found')
+            return
+
         depth = self.headers.get('Depth', '1')
 
         # Read and discard request body
@@ -291,7 +306,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             responses.append(self._propfind_dir_response('/'))
 
             if depth != '0':
-                manifests = self.pool.manifest_mgr.list_manifests('/')
+                manifests = self.pool.manifest_mgr.list_manifests('/', recursive=True)
                 dirs = set()
                 for m in manifests:
                     rd = m.get('remote_dir', '/')
@@ -315,25 +330,46 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     path, manifest['file_size'], manifest.get('created_at', 0)
                 ))
             else:
-                manifests = self.pool.manifest_mgr.list_manifests(path)
+                manifests = self.pool.manifest_mgr.list_manifests(path, recursive=True)
                 if manifests:
                     responses.append(self._propfind_dir_response(path))
                     if depth != '0':
+                        # Find subdirectories within this directory
+                        subdirs = set()
                         for m in manifests:
-                            responses.append(self._propfind_file_response(
-                                m['file_path'], m['file_size'], m.get('created_at', 0)
-                            ))
+                            rd = m.get('remote_dir', '/')
+                            # Check if this file is in a subdirectory of current path
+                            if rd != path and rd.startswith(path.rstrip('/') + '/'):
+                                # Extract the immediate subdirectory name
+                                remaining = rd[len(path.rstrip('/') + '/'):]
+                                subdir_name = remaining.split('/')[0]
+                                if subdir_name:
+                                    subdirs.add(path.rstrip('/') + '/' + subdir_name)
+                        
+                        # Add subdirectory responses
+                        for subdir in sorted(subdirs):
+                            responses.append(self._propfind_dir_response(subdir))
+                        
+                        # Add file responses (files directly in this directory only)
+                        for m in manifests:
+                            if m.get('remote_dir', '/') == path:
+                                responses.append(self._propfind_file_response(
+                                    m['file_path'], m['file_size'], m.get('created_at', 0)
+                                ))
                 else:
-                    self.send_error(404, 'Not Found')
+                    self._safe_send_error(404, 'Not Found')
                     return
 
         xml = self._build_multistatus(responses)
 
-        self.send_response(207)
-        self.send_header('Content-Type', 'application/xml; charset=utf-8')
-        self.send_header('Content-Length', str(len(xml)))
-        self.end_headers()
-        self.wfile.write(xml)
+        try:
+            self.send_response(207)
+            self.send_header('Content-Type', 'application/xml; charset=utf-8')
+            self.send_header('Content-Length', str(len(xml)))
+            self.end_headers()
+            self.wfile.write(xml)
+        except (BrokenPipeError, ConnectionResetError):
+            log.debug("Client disconnected during PROPFIND response")
 
     # ─── XML / Response Helpers ────────────────────────────
 
@@ -388,6 +424,26 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             timestamp = time.time()
         return time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(timestamp))
 
+    def _is_browser_resource(self, path: str) -> bool:
+        """Check if path is a common browser resource that should return 404."""
+        browser_resources = {
+            '/favicon.ico',
+            '/apple-touch-icon.png',
+            '/apple-touch-icon-precomposed.png',
+            '/apple-touch-icon-120x120.png',
+            '/apple-touch-icon-120x120-precomposed.png',
+            '/robots.txt',
+            '/sitemap.xml',
+        }
+        return path in browser_resources
+
+    def _safe_send_error(self, code: int, message: str):
+        """Send error response, catching broken pipe errors."""
+        try:
+            self.send_error(code, message)
+        except (BrokenPipeError, ConnectionResetError):
+            log.debug(f"Client disconnected before receiving {code} error")
+
     def _guess_content_type(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
         types = {
@@ -429,7 +485,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         return types.get(ext, 'application/octet-stream')
 
     def _send_directory_listing(self, path: str):
-        manifests = self.pool.manifest_mgr.list_manifests(path)
+        manifests = self.pool.manifest_mgr.list_manifests(path, recursive=True)
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -443,6 +499,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
     th {{ color: #aaa; }}
     .size {{ text-align: right; }}
     h2 {{ color: #4fc3f7; }}
+    .dir {{ color: #ffd700; }}
 </style>
 </head>
 <body>
@@ -454,15 +511,37 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             parent = '/'.join(path.rstrip('/').split('/')[:-1]) or '/'
             html += f'<tr><td><a href="{quote(parent)}">⬆️ ..</a></td><td></td><td></td><td></td></tr>\n'
 
+        # Find subdirectories
+        subdirs = set()
         for m in manifests:
-            size_str = self._human_size(m['file_size'])
-            remotes_used = ', '.join(sorted(set(c['remote'] for c in m['chunks'])))
+            rd = m.get('remote_dir', '/')
+            if rd != path and rd.startswith(path.rstrip('/') + '/'):
+                remaining = rd[len(path.rstrip('/') + '/'):]
+                subdir_name = remaining.split('/')[0]
+                if subdir_name:
+                    subdirs.add(subdir_name)
+        
+        # Add subdirectories
+        for subdir in sorted(subdirs):
+            subdir_path = path.rstrip('/') + '/' + subdir
             html += (f'<tr>'
-                     f'<td><a href="{quote(m["file_path"])}">{m["file_name"]}</a></td>'
-                     f'<td class="size">{size_str}</td>'
-                     f'<td>{len(m["chunks"])}</td>'
-                     f'<td>{remotes_used}</td>'
+                     f'<td class="dir"><a href="{quote(subdir_path)}">📁 {subdir}/</a></td>'
+                     f'<td class="size">—</td>'
+                     f'<td>—</td>'
+                     f'<td>—</td>'
                      f'</tr>\n')
+
+        # Add files (only in current directory)
+        for m in manifests:
+            if m.get('remote_dir', '/') == path:
+                size_str = self._human_size(m['file_size'])
+                remotes_used = ', '.join(sorted(set(c['remote'] for c in m['chunks'])))
+                html += (f'<tr>'
+                         f'<td><a href="{quote(m["file_path"])}">{m["file_name"]}</a></td>'
+                         f'<td class="size">{size_str}</td>'
+                         f'<td>{len(m["chunks"])}</td>'
+                         f'<td>{remotes_used}</td>'
+                         f'</tr>\n')
 
         html += """</table>
 <hr>

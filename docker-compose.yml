@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  rclonepool:
+    build: .
+    image: rclonepool:latest
+    container_name: rclonepool
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your config directory
+      - ./config:/config:ro
+      # Optional: Mount a local cache directory
+      - rclonepool-cache:/tmp/rclonepool
+    environment:
+      - RCLONE_CONFIG=/config/rclone.conf
+      - RCLONEPOOL_CONFIG=/config/config.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  rclonepool-cache:
+    driver: local

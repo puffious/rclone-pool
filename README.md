@@ -1,5 +1,8 @@
 # rclonepool
 
+![Tests](https://github.com/YOURUSERNAME/rclone-pool/workflows/Tests/badge.svg)
+![Docker](https://github.com/YOURUSERNAME/rclone-pool/workflows/Docker%20Build%20and%20Push/badge.svg)
+
 Distribute files as encrypted chunks across multiple rclone remotes, presenting them as a single unified storage pool.
 
 ---
@@ -227,6 +230,66 @@ rclone serve http rclonepool: --addr :9090
 
 ---
 
+## Testing
+
+### Running Tests Locally
+
+```bash
+# Run all tests
+python tests/run_tests.py
+
+# Run specific test file
+python -m unittest tests.test_chunker
+
+# Run with verbose output
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+### Test Coverage
+
+- **Unit tests**: `chunker.py`, `balancer.py`, `manifest.py`, `config.py`
+- **Integration tests**: Full upload/download/delete workflows with local file system remotes
+- **CI/CD**: Automated testing on every push via GitHub Actions
+
+---
+
+## Docker
+
+### Quick Start with Docker
+
+```bash
+# Pull and run
+docker run -d \
+  --name rclonepool \
+  -p 8080:8080 \
+  -v $(pwd)/config:/config:ro \
+  ghcr.io/YOURUSERNAME/rclone-pool:latest
+```
+
+### Using Docker Compose
+
+```bash
+# Create config directory with rclone.conf and config.json
+mkdir -p config
+
+# Start the service
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+```
+
+### Building Locally
+
+```bash
+docker build -t rclonepool:local .
+docker run -d -p 8080:8080 -v $(pwd)/config:/config:ro rclonepool:local
+```
+
+See [DOCKER.md](DOCKER.md) for detailed Docker documentation.
+
+---
+
 ## Configuration Options
 
 | Key | Default | Description |
@@ -330,7 +393,22 @@ rclonepool/
 ├── webdav_server.py       # WebDAV interface for rclone compatibility
 ├── rclone_backend.py      # Wrapper around rclone CLI calls
 ├── requirements.txt       # (empty — pure stdlib)
-└── README.md
+├── Dockerfile             # Docker containerization
+├── docker-compose.yml     # Docker Compose configuration
+├── .github/workflows/     # CI/CD pipelines
+│   ├── test.yml           # Automated testing
+│   └── docker.yml         # Docker image build & push
+├── tests/                 # Test suite
+│   ├── test_chunker.py    # Unit tests for chunker
+│   ├── test_balancer.py   # Unit tests for balancer
+│   ├── test_manifest.py   # Unit tests for manifest
+│   ├── test_config.py     # Unit tests for config
+│   ├── test_integration.py # Integration tests
+│   └── run_tests.py       # Test runner
+├── docs/                  # Documentation
+│   └── CONTEXT.md         # Detailed system documentation
+├── DOCKER.md              # Docker usage guide
+└── README.md              # This file
 ```
 
 ---
