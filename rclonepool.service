@@ -1,0 +1,45 @@
+[Unit]
+Description=rclonepool - Unified chunked encrypted storage pool
+Documentation=https://github.com/rclonepool/rclonepool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i
+
+# Main service command - starts WebDAV server
+ExecStart=/usr/local/bin/rclonepool serve --host 0.0.0.0 --port 8080
+
+# Optional: Start API server on different port
+# ExecStartPost=/usr/local/bin/rclonepool api --host 0.0.0.0 --port 8081
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/dev/shm/rclonepool /home/%i/.cache/rclonepool
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=200%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rclonepool
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+Environment="RCLONEPOOL_CONFIG=/home/%i/.config/rclonepool/config.json"
+
+[Install]
+WantedBy=multi-user.target
